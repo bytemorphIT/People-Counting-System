@@ -37,379 +37,398 @@
 
 
 
+
 import cv2
 import threading
 import numpy as np
-import os
 from ultralytics import YOLO
 from datetime import datetime, timedelta
 from collections import deque
-from enum import Enum
+import time
 
-# ─────────── CONFIG ───────────
-RTSP_URL = "rtsp://admin:123456@192.168.1.77/H264?ch=1&subtype=0"
-MODEL = YOLO("best-3.pt")
-FRAME_W, FRAME_H = 1280, 720
-CONFIDENCE_THRESHOLD = 0.5
 
-# ─────────── ENHANCED LINE LOGIC ───────────
-class Direction(Enum):
-    ENTRY = "entry"
-    EXIT = "exit"
-    UNKNOWN = "unknown"
+class Config:
+    """Configuration constants"""
+    RTSP_URL = "rtsp://admin:123456@192.168.1.77/H264?ch=1&subtype=1"
+    MODEL_PATH = "best-3.pt"
+    FRAME_W, FRAME_H = 1280, 720
+    CONFIDENCE_THRESHOLD = 0.5
+    THRESHOLD = 180  # distance from center
+    MAX_POSITION_HISTORY = 6
+    COUNT_COOLDOWN = timedelta(milliseconds=500)
+    STALE_TIME = timedelta(seconds=2)
+    IOU_THRESHOLD = 0.5
 
-class PersonState(Enum):
-    INSIDE = "inside"
-    OUTSIDE = "outside" 
-    CROSSING = "crossing"
-    UNKNOWN = "unknown"
 
-# Line configuration
-MIDDLE_LINE_Y = FRAME_H // 2
-CROSSING_BUFFER = 30  # Buffer zone around the line
-ENTRY_ZONE = (0, MIDDLE_LINE_Y - CROSSING_BUFFER)  # Above line
-EXIT_ZONE = (MIDDLE_LINE_Y + CROSSING_BUFFER, FRAME_H)  # Below line
-CROSSING_ZONE = (MIDDLE_LINE_Y - CROSSING_BUFFER, MIDDLE_LINE_Y + CROSSING_BUFFER)
-
-# State tracking
-person_states = {}
-entry_count = 0
-exit_count = 0
-
-# Performance tracking
-total_detection_conf_sum = 0.0
-total_detection_conf_count = 0
-total_person_conf_sum = 0.0
-total_person_conf_count = 0
-
-# ──────── ENHANCED PERSON TRACKING CLASS ────────
 class PersonTracker:
-    def __init__(self, track_id, initial_y):
-        self.track_id = track_id
-        self.positions = deque([initial_y], maxlen=8)  # Increased history for better accuracy
-        self.state = PersonState.UNKNOWN
-        self.last_count_time = datetime.min
-        self.last_seen = datetime.now()
-        self.crossing_direction = Direction.UNKNOWN
-        self.stable_positions = 0  # Count of consecutive stable positions
-        self.min_crossing_distance = 40  # Minimum distance to travel for valid crossing
-        
-    def update_position(self, y_pos):
-        self.positions.append(y_pos)
-        self.last_seen = datetime.now()
-        
-        # Update stability counter
-        if len(self.positions) >= 2:
-            if abs(self.positions[-1] - self.positions[-2]) < 10:
-                self.stable_positions += 1
-            else:
-                self.stable_positions = 0
-    
-    def get_movement_direction(self):
-        """Enhanced direction detection with noise filtering"""
-        if len(self.positions) < 3:
-            return Direction.UNKNOWN
-            
-        # Use multiple points for more stable direction detection
-        recent_positions = list(self.positions)[-5:]  # Last 5 positions
-        if len(recent_positions) < 3:
-            return Direction.UNKNOWN
-            
-        # Calculate weighted movement (more weight to recent positions)
-        weighted_movement = 0
-        total_weight = 0
-        
-        for i in range(1, len(recent_positions)):
-            weight = i  # Increasing weight for more recent positions
-            movement = recent_positions[i] - recent_positions[i-1]
-            weighted_movement += movement * weight
-            total_weight += weight
-            
-        if total_weight == 0:
-            return Direction.UNKNOWN
-            
-        avg_movement = weighted_movement / total_weight
-        
-        # Threshold for significant movement
-        if avg_movement > 5:
-            return Direction.EXIT  # Moving down
-        elif avg_movement < -5:
-            return Direction.ENTRY  # Moving up
-        else:
-            return Direction.UNKNOWN
-    
-    def has_crossed_line(self):
-        """Enhanced line crossing detection"""
-        if len(self.positions) < 2:
-            return False, Direction.UNKNOWN
-            
-        current_y = self.positions[-1]
-        
-        # Check if person has traveled sufficient distance
-        y_range = max(self.positions) - min(self.positions)
-        if y_range < self.min_crossing_distance:
-            return False, Direction.UNKNOWN
-            
-        # Enhanced crossing logic with zone-based detection
-        direction = self.get_movement_direction()
-        
-        if direction == Direction.ENTRY:
-            # Check if person moved from exit zone to entry zone
-            has_exit_history = any(pos > MIDDLE_LINE_Y + CROSSING_BUFFER for pos in self.positions)
-            in_entry_zone = current_y < MIDDLE_LINE_Y - CROSSING_BUFFER
-            
-            if has_exit_history and in_entry_zone:
-                return True, Direction.ENTRY
-                
-        elif direction == Direction.EXIT:
-            # Check if person moved from entry zone to exit zone  
-            has_entry_history = any(pos < MIDDLE_LINE_Y - CROSSING_BUFFER for pos in self.positions)
-            in_exit_zone = current_y > MIDDLE_LINE_Y + CROSSING_BUFFER
-            
-            if has_entry_history and in_exit_zone:
-                return True, Direction.EXIT
-                
-        return False, Direction.UNKNOWN
-    
-    def can_count(self, cooldown_period=timedelta(seconds=1)):
-        """Check if enough time has passed since last count"""
-        return datetime.now() - self.last_count_time > cooldown_period
-    
-    def is_stable(self, min_stable_frames=3):
-        """Check if person has been relatively stable"""
-        return self.stable_positions >= min_stable_frames
+    """Handles person tracking and counting logic"""
 
-# ────── OPTIMIZED LINE CROSSING LOGIC ──────
-def process_line_crossings(person_trackers):
-    global entry_count, exit_count
-    
-    crossings_detected = []
-    
-    for tracker in person_trackers.values():
-        if not tracker.can_count():
-            continue
-            
-        has_crossed, direction = tracker.has_crossed_line()
-        
-        if has_crossed and direction != Direction.UNKNOWN:
-            if direction == Direction.ENTRY:
-                entry_count += 1
-                tracker.state = PersonState.INSIDE
-                tracker.last_count_time = datetime.now()
-                crossings_detected.append(("ENTRY", tracker.track_id))
-                
-            elif direction == Direction.EXIT:
-                exit_count += 1
-                tracker.state = PersonState.OUTSIDE  
-                tracker.last_count_time = datetime.now()
-                crossings_detected.append(("EXIT", tracker.track_id))
-    
-    return crossings_detected
+    def __init__(self):
+        self.person_states = {}
+        self.entry_count = 0
+        self.exit_count = 0
 
-# ────── ENHANCED DEBUG LOGGING ──────
-debug_path = "debug_optimized.txt"
-with open(debug_path, "w") as f:
-    f.write("OPTIMIZED DEBUG LOG for YOLO Person Counter\n")
-    f.write("Enhanced line crossing logic with zone-based detection\n")
-    f.write("=" * 70 + "\n")
-    f.write(f"[{datetime.now()}] Debugging session started.\n")
-    f.write("-" * 70 + "\n")
+        # Line coordinates
+        self.middle_line_y = Config.FRAME_H // 2
+        self.upper_line_y = self.middle_line_y - Config.THRESHOLD
+        self.lower_line_y = self.middle_line_y + Config.THRESHOLD
 
-def log_crossing_event(event_type, track_id, tracker):
-    with open(debug_path, "a") as f:
-        f.write(f"[{datetime.now()}] {event_type} - ID {track_id}\n")
-        f.write(f"    Position history: {list(tracker.positions)}\n")
-        f.write(f"    Movement direction: {tracker.get_movement_direction()}\n")
-        f.write(f"    Y range traveled: {max(tracker.positions) - min(tracker.positions)}\n")
-        f.write(f"    Entry count: {entry_count}, Exit count: {exit_count}\n")
-        f.write("-" * 50 + "\n")
+        # Pre-computed line points
+        self.line_pts = {
+            'middle': [(0, self.middle_line_y), (Config.FRAME_W, self.middle_line_y)],
+            'upper': [(0, self.upper_line_y), (Config.FRAME_W, self.upper_line_y)],
+            'lower': [(0, self.lower_line_y), (Config.FRAME_W, self.lower_line_y)]
+        }
 
-# ────── VIDEO STREAM (SAME AS ORIGINAL) ──────
+        # Debug logging
+        self._init_debug_log()
+
+    def _init_debug_log(self):
+        """Initialize debug logging"""
+        self.debug_path = "debug.txt"
+        with open(self.debug_path, "w") as f:
+            f.write("DEBUG LOG for YOLO Person Counter\n")
+            f.write("Purpose: Track detection and crossing accuracy.\n")
+            f.write("=" * 60 + "\n")
+            f.write(f"[{datetime.now()}] Debugging session started.\n")
+            f.write("-" * 60 + "\n")
+
+    def update_tracking(self, detections, current_time):
+        """Update person tracking and count crossings"""
+        for detection in detections:
+            self._process_detection(detection, current_time)
+
+        # Clean up stale tracking IDs
+        self._cleanup_stale_ids(current_time)
+
+    def _process_detection(self, detection, current_time):
+        """Process individual detection"""
+        tid, cx, cy, confidence = detection
+
+        if tid not in self.person_states:
+            self.person_states[tid] = {
+                'last_positions': deque([cy], maxlen=Config.MAX_POSITION_HISTORY),
+                'last_count_time': datetime.min,
+                'last_seen': current_time,
+                'state': 'unknown'
+            }
+            return
+
+        state_info = self.person_states[tid]
+        state_info['last_seen'] = current_time
+        positions = state_info['last_positions']
+        positions.append(cy)
+
+        if len(positions) >= 2:
+            self._check_line_crossing(tid, positions, state_info, current_time)
+
+    def _check_line_crossing(self, tid, positions, state_info, current_time):
+        """Check if person crossed counting lines"""
+        last_cy = positions[-2]
+        current_cy = positions[-1]
+        can_count = current_time - state_info['last_count_time'] > Config.COUNT_COOLDOWN
+
+        # Log movement
+        with open(self.debug_path, "a") as f:
+            f.write(
+                f"[{current_time}] ID {tid} | last_cy={last_cy}, current_cy={current_cy}, state={state_info['state']}\n")
+
+        if not can_count:
+            return
+
+        # Entry detection (upward crossing)
+        if last_cy > self.upper_line_y >= current_cy:
+            self._count_entry(tid, state_info, current_time)
+
+        # Exit detection (downward crossing)
+        elif last_cy < self.lower_line_y <= current_cy:
+            self._count_exit(tid, state_info, current_time)
+
+    def _count_entry(self, tid, state_info, current_time):
+        """Count entry event"""
+        self.entry_count += 1
+        state_info['state'] = "inside"
+        state_info['last_count_time'] = current_time
+        print(f"[ENTRY] ID {tid} | Total Entry: {self.entry_count}")
+
+        with open(self.debug_path, "a") as f:
+            f.write(f"--> ENTRY COUNTED!\n")
+            f.write(f"    Entry Count: {self.entry_count}, Exit Count: {self.exit_count}\n")
+            f.write("-" * 40 + "\n")
+
+    def _count_exit(self, tid, state_info, current_time):
+        """Count exit event"""
+        self.exit_count += 1
+        state_info['state'] = "outside"
+        state_info['last_count_time'] = current_time
+        print(f"[EXIT] ID {tid} | Total Exit: {self.exit_count}")
+
+        with open(self.debug_path, "a") as f:
+            f.write(f"--> EXIT COUNTED!\n")
+            f.write(f"    Entry Count: {self.entry_count}, Exit Count: {self.exit_count}\n")
+            f.write("-" * 40 + "\n")
+
+    def _cleanup_stale_ids(self, current_time):
+        """Remove stale tracking IDs"""
+        stale_ids = [
+            tid for tid, state in self.person_states.items()
+            if current_time - state['last_seen'] > Config.STALE_TIME
+        ]
+        for tid in stale_ids:
+            self.person_states.pop(tid)
+
+
+class ConfidenceTracker:
+    """Tracks detection confidence statistics"""
+
+    def __init__(self):
+        self.total_detection_conf_sum = 0.0
+        self.total_detection_conf_count = 0
+        self.total_person_conf_sum = 0.0
+        self.total_person_conf_count = 0
+
+    def update(self, detection_confidences, person_confidences):
+        """Update confidence statistics"""
+        if detection_confidences:
+            self.total_detection_conf_sum += sum(detection_confidences)
+            self.total_detection_conf_count += len(detection_confidences)
+
+        if person_confidences:
+            self.total_person_conf_sum += sum(person_confidences)
+            self.total_person_conf_count += len(person_confidences)
+
+    @property
+    def avg_detection_conf(self):
+        """Get average detection confidence"""
+        if self.total_detection_conf_count == 0:
+            return 0
+        return (self.total_detection_conf_sum / self.total_detection_conf_count) * 100
+
+    @property
+    def avg_person_conf(self):
+        """Get average person confidence"""
+        if self.total_person_conf_count == 0:
+            return 0
+        return (self.total_person_conf_sum / self.total_person_conf_count) * 100
+
+
 class VideoStream:
+    """Threaded video stream handler"""
+
     def __init__(self, src):
         self.cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
         if not self.cap.isOpened():
-            print("Error: Unable to open video stream")
+            raise ConnectionError("Unable to open video stream")
+
         self.frame = None
         self.stopped = False
-        self.thread = threading.Thread(target=self.update, daemon=True)
+        self.lock = threading.Lock()
+        self.thread = threading.Thread(target=self._update, daemon=True)
         self.thread.start()
 
-    def update(self):
+    def _update(self):
+        """Update frame in separate thread"""
         while not self.stopped:
             ret, frame = self.cap.read()
             if ret:
-                self.frame = frame
+                with self.lock:
+                    self.frame = frame
+            time.sleep(0.01)  # Small delay to prevent excessive CPU usage
 
     def read(self):
-        return self.frame is not None, self.frame
+        """Read current frame"""
+        with self.lock:
+            return self.frame is not None, self.frame
 
     def stop(self):
+        """Stop video stream"""
         self.stopped = True
         self.thread.join()
         self.cap.release()
 
-# ──────── MAIN LOOP WITH OPTIMIZED LOGIC ────────
-stream = VideoStream(RTSP_URL)
-cv2.namedWindow("Optimized Person Counter")
 
-STALE_TIME = timedelta(seconds=3)
-person_trackers = {}
+class Visualizer:
+    """Handles frame visualization and UI overlay"""
 
-while True:
-    ok, frame = stream.read()
-    if not ok or frame is None:
-        print("Waiting for video feed...")
-        cv2.waitKey(10)
-        continue
+    def __init__(self, tracker):
+        self.tracker = tracker
 
-    frame = cv2.resize(frame, (FRAME_W, FRAME_H))
-    results = MODEL.track(frame, persist=True, conf=CONFIDENCE_THRESHOLD, iou=0.5)[0]
+        # Pre-defined colors
+        self.colors = {
+            'detection_box': (0, 255, 0),
+            'center_point': (255, 0, 0),
+            'trajectory': (200, 100, 255),
+            'middle_line': (0, 255, 255),
+            'entry_line': (0, 255, 0),
+            'exit_line': (0, 0, 255),
+            'text_white': (255, 255, 255),
+            'text_yellow': (255, 255, 0)
+        }
 
-    current_time = datetime.now()
-    active_tracks = set()
+    def draw_frame(self, frame, detections, conf_tracker):
+        """Draw all visualizations on frame"""
+        self._draw_reference_lines(frame)
+        self._draw_detections(frame, detections)
+        self._draw_statistics(frame, conf_tracker)
+        return frame
 
-    # Process detections
-    if results.boxes.id is not None:
-        for box, tid_raw in zip(results.boxes, results.boxes.id):
-            cls_id = int(box.cls[0])
-            class_name = MODEL.names[cls_id]
-            confidence = float(box.conf[0])
-            tid = int(tid_raw)
+    def _draw_reference_lines(self, frame):
+        """Draw counting reference lines"""
+        # Draw lines
+        cv2.line(frame, *self.tracker.line_pts['middle'], self.colors['middle_line'], 2)
+        cv2.line(frame, *self.tracker.line_pts['upper'], self.colors['entry_line'], 2)
+        cv2.line(frame, *self.tracker.line_pts['lower'], self.colors['exit_line'], 2)
 
-            if class_name != "person" or confidence < CONFIDENCE_THRESHOLD:
-                continue
+        # Draw labels
+        cv2.putText(frame, "ENTRY ↑", (10, self.tracker.upper_line_y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.colors['entry_line'], 2)
+        cv2.putText(frame, "EXIT ↓", (Config.FRAME_W - 130, self.tracker.lower_line_y + 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.colors['exit_line'], 2)
 
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            cx = (x1 + x2) // 2
-            cy = (y1 + y2) // 2
+    def _draw_detections(self, frame, detections):
+        """Draw detection boxes and trajectories"""
+        for tid, cx, cy, confidence, bbox in detections:
+            x1, y1, x2, y2 = bbox
 
-            active_tracks.add(tid)
+            # Draw bounding box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), self.colors['detection_box'], 2)
 
-            # Update or create tracker
-            if tid not in person_trackers:
-                person_trackers[tid] = PersonTracker(tid, cy)
-            else:
-                person_trackers[tid].update_position(cy)
+            # Draw center point
+            cv2.circle(frame, (cx, cy), 4, self.colors['center_point'], -1)
 
-            # Confidence tracking
-            total_detection_conf_sum += confidence
-            total_detection_conf_count += 1
-            total_person_conf_sum += confidence
-            total_person_conf_count += 1
-
-            # Draw enhanced visualization
-            tracker = person_trackers[tid]
-            
-            # Color coding based on zone
-            if cy < MIDDLE_LINE_Y - CROSSING_BUFFER:
-                zone_color = (0, 255, 0)  # Green for entry zone
-                zone_text = "ENTRY ZONE"
-            elif cy > MIDDLE_LINE_Y + CROSSING_BUFFER:
-                zone_color = (0, 0, 255)  # Red for exit zone  
-                zone_text = "EXIT ZONE"
-            else:
-                zone_color = (0, 255, 255)  # Yellow for crossing zone
-                zone_text = "CROSSING"
-
-            cv2.rectangle(frame, (x1, y1), (x2, y2), zone_color, 2)
-            cv2.circle(frame, (cx, cy), 4, (255, 0, 0), -1)
-            
-            # Enhanced info display
-            cv2.putText(frame, f"ID {tid} {confidence:.2f}", (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-            cv2.putText(frame, zone_text, (x1, y1 - 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, zone_color, 1)
-            
-            # Draw trajectory with direction arrow
-            positions = list(tracker.positions)
-            if len(positions) > 1:
+            # Draw trajectory
+            if tid in self.tracker.person_states:
+                positions = self.tracker.person_states[tid]['last_positions']
                 for i in range(1, len(positions)):
-                    alpha = i / len(positions)  # Fade older positions
-                    color = (int(200 * alpha), int(100 * alpha), int(255 * alpha))
-                    cv2.line(frame, (cx, positions[i-1]), (cx, positions[i]), color, 2)
+                    cv2.line(frame, (cx, positions[i - 1]), (cx, positions[i]),
+                             self.colors['trajectory'], 2)
 
-    # Process line crossings
-    crossings = process_line_crossings(person_trackers)
-    
-    # Log crossings
-    for event_type, track_id in crossings:
-        log_crossing_event(event_type, track_id, person_trackers[track_id])
-        print(f"[{event_type}] ID {track_id} | Entry: {entry_count}, Exit: {exit_count}")
+            # Draw labels
+            cv2.putText(frame, f"ID {tid} {confidence:.2f}", (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors['text_white'], 2)
+            cv2.putText(frame, "person", (x1, y1 - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors['detection_box'], 2)
 
-    # Remove stale trackers
-    stale_ids = [tid for tid, tracker in person_trackers.items() 
-                 if current_time - tracker.last_seen > STALE_TIME]
-    for tid in stale_ids:
-        person_trackers.pop(tid)
+    def _draw_statistics(self, frame, conf_tracker):
+        """Draw counting statistics"""
+        # Count display
+        cv2.putText(frame, f"Entered: {self.tracker.entry_count}", (10, Config.FRAME_H - 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, self.colors['entry_line'], 2)
+        cv2.putText(frame, f"Exited:  {self.tracker.exit_count}", (Config.FRAME_W - 230, Config.FRAME_H - 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, self.colors['exit_line'], 2)
 
-    # Calculate average confidences
-    avg_detection_conf = (total_detection_conf_sum / total_detection_conf_count * 100) if total_detection_conf_count else 0
-    avg_person_conf = (total_person_conf_sum / total_person_conf_count * 100) if total_person_conf_count else 0
+        # Confidence display
+        cv2.putText(frame, f"Detection Conf (All): {conf_tracker.avg_detection_conf:.1f}%",
+                    (10, Config.FRAME_H - 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['text_yellow'], 2)
+        cv2.putText(frame, f"Person Conf: {conf_tracker.avg_person_conf:.1f}%",
+                    (10, Config.FRAME_H - 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['entry_line'], 2)
 
-    # Enhanced UI with zone visualization
-    # Draw zones
-    cv2.rectangle(frame, (0, 0), (FRAME_W, MIDDLE_LINE_Y - CROSSING_BUFFER), (0, 100, 0), 2)  # Entry zone
-    cv2.rectangle(frame, (0, MIDDLE_LINE_Y + CROSSING_BUFFER), (FRAME_W, FRAME_H), (0, 0, 100), 2)  # Exit zone
-    
-    # Main crossing line
-    cv2.line(frame, (0, MIDDLE_LINE_Y), (FRAME_W, MIDDLE_LINE_Y), (0, 255, 255), 3)
-    
-    # Buffer zone lines
-    cv2.line(frame, (0, MIDDLE_LINE_Y - CROSSING_BUFFER), (FRAME_W, MIDDLE_LINE_Y - CROSSING_BUFFER), (255, 255, 0), 1)
-    cv2.line(frame, (0, MIDDLE_LINE_Y + CROSSING_BUFFER), (FRAME_W, MIDDLE_LINE_Y + CROSSING_BUFFER), (255, 255, 0), 1)
 
-    # Labels and counts
-    cv2.putText(frame, "ENTRY ↑", (10, MIDDLE_LINE_Y - CROSSING_BUFFER - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-    cv2.putText(frame, "EXIT ↓", (FRAME_W - 130, MIDDLE_LINE_Y + CROSSING_BUFFER + 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-
-    # Enhanced stats display
-    cv2.putText(frame, f"Entered: {entry_count}", (10, FRAME_H - 80),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-    cv2.putText(frame, f"Exited: {exit_count}", (FRAME_W - 200, FRAME_H - 80),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-    cv2.putText(frame, f"Net Count: {entry_count - exit_count}", (FRAME_W//2 - 100, FRAME_H - 80),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-
-    cv2.putText(frame, f"Active Tracks: {len(person_trackers)}", (10, FRAME_H - 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-    cv2.putText(frame, f"Avg Confidence: {avg_person_conf:.1f}%", (10, FRAME_H - 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-    cv2.imshow("Optimized Person Counter", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-# ────── CLEANUP & FINAL STATS ──────
-def save_count(ent, ext):
+def save_count(entry_count, exit_count):
+    """Save count to file"""
     fname = datetime.now().strftime("count_log_%Y-%m-%d.txt")
     with open(fname, "w") as f:
-        f.write(f"=== Optimized Person Counter Results ===\n")
-        f.write(f"People Entered: {ent}\n")
-        f.write(f"People Exited: {ext}\n")
-        f.write(f"Net Count: {ent - ext}\n")
-        f.write(f"Total Crossings: {ent + ext}\n")
+        f.write(f"People Entered: {entry_count}\nPeople Exited: {exit_count}\n")
 
-save_count(entry_count, exit_count)
 
-final_avg_detection_conf = (total_detection_conf_sum / total_detection_conf_count * 100) if total_detection_conf_count > 0 else 0
-final_avg_person_conf = (total_person_conf_sum / total_person_conf_count * 100) if total_person_conf_count > 0 else 0
+def extract_detections(results):
+    """Extract detection data from YOLO results"""
+    detections = []
+    detection_confidences = []
+    person_confidences = []
 
-with open(debug_path, "a") as f:
-    f.write("\n=== FINAL OPTIMIZED STATS ===\n")
-    f.write(f"Total Entries: {entry_count}\n")
-    f.write(f"Total Exits: {exit_count}\n") 
-    f.write(f"Net Count: {entry_count - exit_count}\n")
-    f.write(f"Total Crossings: {entry_count + exit_count}\n")
-    f.write(f"Average Detection Confidence: {final_avg_detection_conf:.2f}%\n")
-    f.write(f"Average Person Detection Confidence: {final_avg_person_conf:.2f}%\n")
-    f.write("=" * 70 + "\n")
+    if results.boxes.id is None:
+        return detections, detection_confidences, person_confidences
 
-print(f"\nFinal Results:")
-print(f"Entries: {entry_count}, Exits: {exit_count}, Net: {entry_count - exit_count}")
-print(f"Average Person Detection Confidence: {final_avg_person_conf:.2f}%")
+    for box, tid_raw in zip(results.boxes, results.boxes.id):
+        cls_id = int(box.cls[0])
+        class_name = results.names[cls_id]
+        confidence = float(box.conf[0])
+        tid = int(tid_raw)
 
-stream.stop()
-cv2.destroyAllWindows()
+        detection_confidences.append(confidence)
+
+        if class_name != "person" or confidence < Config.CONFIDENCE_THRESHOLD:
+            continue
+
+        person_confidences.append(confidence)
+
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+
+        detections.append((tid, cx, cy, confidence, (x1, y1, x2, y2)))
+
+    return detections, detection_confidences, person_confidences
+
+
+def main():
+    """Main execution function"""
+    # Initialize components
+    model = YOLO(Config.MODEL_PATH)
+    tracker = PersonTracker()
+    conf_tracker = ConfidenceTracker()
+    visualizer = Visualizer(tracker)
+
+    try:
+        stream = VideoStream(Config.RTSP_URL)
+        cv2.namedWindow("Person Counter", cv2.WINDOW_NORMAL)
+
+        print("Person counter started. Press 'q' to quit.")
+
+        while True:
+            ok, frame = stream.read()
+            if not ok or frame is None:
+                print("Waiting for video feed...")
+                cv2.waitKey(10)
+                continue
+
+            # Resize frame
+            frame = cv2.resize(frame, (Config.FRAME_W, Config.FRAME_H))
+
+            # Run YOLO detection
+            results = model.track(frame, persist=True, conf=Config.CONFIDENCE_THRESHOLD,
+                                  iou=Config.IOU_THRESHOLD)[0]
+
+            # Extract detection data
+            detections, detection_confs, person_confs = extract_detections(results)
+
+            # Update tracking and confidence stats
+            current_time = datetime.now()
+            tracker.update_tracking([(d[0], d[1], d[2], d[3]) for d in detections], current_time)
+            conf_tracker.update(detection_confs, person_confs)
+
+            # Draw visualizations
+            frame = visualizer.draw_frame(frame, detections, conf_tracker)
+
+            # Display frame
+            cv2.imshow("Person Counter", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+        # Cleanup and save results
+        save_count(tracker.entry_count, tracker.exit_count)
+
+        # Write final stats to debug log
+        with open(tracker.debug_path, "a") as f:
+            f.write("\n=== FINAL STATS ===\n")
+            f.write(f"Total Crossings: {tracker.entry_count + tracker.exit_count}\n")
+            f.write(f"Avg Detection Confidence (all): {conf_tracker.avg_detection_conf:.2f}%\n")
+            f.write(f"Avg Person Detection Confidence: {conf_tracker.avg_person_conf:.2f}%\n")
+            f.write("=" * 60 + "\n")
+
+        print(f"\nFinal Results:")
+        print(f"Entries: {tracker.entry_count}, Exits: {tracker.exit_count}")
+        print(f"Average Detection Confidence: {conf_tracker.avg_detection_conf:.2f}%")
+
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        if 'stream' in locals():
+            stream.stop()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
