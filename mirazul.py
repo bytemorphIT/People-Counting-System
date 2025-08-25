@@ -30,17 +30,33 @@
 
 ===========================================================================
 """
+# UPDATED CODE WITH CUDA
 import cv2
 import threading
 import numpy as np
 import os
+import torch
 from ultralytics import YOLO
 from datetime import datetime, timedelta
 from collections import deque
 
+# ─────────── DEVICE / CUDA ───────────
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+USE_FP16 = DEVICE.startswith("cuda")
+print(f"[INFO] Running on {DEVICE}, FP16={USE_FP16}")
+
 # ─────────── CONFIG ───────────
 RTSP_URL = "rtsp://admin:123456@192.168.1.77/H264?ch=1&subtype=1"
-MODEL = YOLO("best-3.pt")  # your trained model
+MODEL = YOLO("best-3.pt")
+MODEL.to(DEVICE)   # push to GPU if available
+if USE_FP16:
+    try:
+        MODEL.model.half()
+        print("[INFO] Using FP16 for faster inference.")
+    except Exception as e:
+        print(f"[WARN] Could not enable FP16: {e}")
+        USE_FP16 = False
+
 FRAME_W, FRAME_H = 1280, 720
 CONFIDENCE_THRESHOLD = 0.5
 
@@ -55,10 +71,10 @@ total_person_conf_sum = 0.0
 total_person_conf_count = 0
 
 # ─────────── LINE & ZONES ───────
-THRESHOLD = 180  # distance from center
+THRESHOLD = 180
 middle_line_y = FRAME_H // 2
-upper_line_y = middle_line_y - THRESHOLD   # Entry trigger line
-lower_line_y = middle_line_y + THRESHOLD   # Exit trigger line
+upper_line_y = middle_line_y - THRESHOLD
+lower_line_y = middle_line_y + THRESHOLD
 
 line_pts_middle = [(0, middle_line_y), (FRAME_W, middle_line_y)]
 line_pts_upper = [(0, upper_line_y), (FRAME_W, upper_line_y)]
@@ -119,7 +135,16 @@ while True:
         continue
 
     frame = cv2.resize(frame, (FRAME_W, FRAME_H))
-    results = MODEL.track(frame, persist=True, conf=CONFIDENCE_THRESHOLD, iou=0.5)[0]
+
+    # ── CUDA Inference ──
+    results = MODEL.track(
+        frame,
+        persist=True,
+        conf=CONFIDENCE_THRESHOLD,
+        iou=0.5,
+        device=DEVICE,     # <-- forces CUDA
+        half=USE_FP16      # <-- FP16 for speed
+    )[0]
 
     detection_confidences = []
     person_confidences = []
@@ -164,37 +189,24 @@ while True:
             can_count = current_time - state_info['last_count_time'] > COUNT_COOLDOWN
             state = state_info['state']
 
-            # Logging movement
             with open(debug_path, "a") as f:
                 f.write(f"[{current_time}] ID {tid} | last_cy={last_cy}, current_cy={current_cy}, state={state}\n")
 
-            # ENTRY (upward across upper line)
             if last_cy > upper_line_y >= current_cy and can_count:
                 entry_count += 1
                 state_info['state'] = "inside"
                 state_info['last_count_time'] = current_time
                 print(f"[ENTRY] ID {tid} | Total Entry: {entry_count}")
-                with open(debug_path, "a") as f:
-                    f.write(f"--> ENTRY COUNTED!\n")
-                    f.write(f"    Entry Count: {entry_count}, Exit Count: {exit_count}\n")
-                    f.write("-" * 40 + "\n")
 
-            # EXIT (downward across lower line)
             elif last_cy < lower_line_y <= current_cy and can_count:
                 exit_count += 1
                 state_info['state'] = "outside"
                 state_info['last_count_time'] = current_time
                 print(f"[EXIT] ID {tid} | Total Exit: {exit_count}")
-                with open(debug_path, "a") as f:
-                    f.write(f"--> EXIT COUNTED!\n")
-                    f.write(f"    Entry Count: {entry_count}, Exit Count: {exit_count}\n")
-                    f.write("-" * 40 + "\n")
 
-            # Draw trajectory
             for i in range(1, len(positions)):
                 cv2.line(frame, (cx, positions[i - 1]), (cx, positions[i]), (200, 100, 255), 2)
 
-            # Draw detections
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.circle(frame, (cx, cy), 4, (255, 0, 0), -1)
             cv2.putText(frame, f"ID {tid} {confidence:.2f}", (x1, y1 - 10),
@@ -202,12 +214,10 @@ while True:
             cv2.putText(frame, class_name, (x1, y1 - 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-    # Remove stale IDs
     stale_ids = [tid for tid, s in person_states.items() if current_time - s['last_seen'] > STALE_TIME]
     for tid in stale_ids:
         person_states.pop(tid)
 
-    # Confidence tracking
     total_detection_conf_sum += sum(detection_confidences)
     total_detection_conf_count += len(detection_confidences)
     total_person_conf_sum += sum(person_confidences)
@@ -216,11 +226,9 @@ while True:
     avg_detection_conf = (total_detection_conf_sum / total_detection_conf_count * 100) if total_detection_conf_count else 0
     avg_person_conf = (total_person_conf_sum / total_person_conf_count * 100) if total_person_conf_count else 0
 
-    # ─────── UI / Overlay ───────
-    # Draw reference lines
-    cv2.line(frame, line_pts_middle[0], line_pts_middle[1], (0, 255, 255), 2)   # middle
-    cv2.line(frame, line_pts_upper[0], line_pts_upper[1], (0, 255, 0), 2)       # entry trigger
-    cv2.line(frame, line_pts_lower[0], line_pts_lower[1], (0, 0, 255), 2)       # exit trigger
+    cv2.line(frame, line_pts_middle[0], line_pts_middle[1], (0, 255, 255), 2)
+    cv2.line(frame, line_pts_upper[0], line_pts_upper[1], (0, 255, 0), 2)
+    cv2.line(frame, line_pts_lower[0], line_pts_lower[1], (0, 0, 255), 2)
 
     cv2.putText(frame, "ENTRY ↑", (10, upper_line_y - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
@@ -241,17 +249,7 @@ while True:
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-# ────── CLEANUP ──────
 save_count(entry_count, exit_count)
-final_avg_detection_conf = (total_detection_conf_sum / total_detection_conf_count * 100) if total_detection_conf_count > 0 else 0
-final_avg_person_conf = (total_person_conf_sum / total_person_conf_count * 100) if total_person_conf_count > 0 else 0
-
-with open(debug_path, "a") as f:
-    f.write("\n=== FINAL STATS ===\n")
-    f.write(f"Total Crossings: {entry_count + exit_count}\n")
-    f.write(f"Avg Detection Confidence (all): {final_avg_detection_conf:.2f}%\n")
-    f.write(f"Avg Person Detection Confidence: {final_avg_person_conf:.2f}%\n")
-    f.write("=" * 60 + "\n")
 
 stream.stop()
 cv2.destroyAllWindows()
